@@ -83,22 +83,50 @@ jobs:
           echo "Downloading KasmVNC from $URL"
           wget -q --tries=3 --timeout=30 "$URL" -O /tmp/kasmvnc.deb
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends /tmp/kasmvnc.deb
+          # 'expect' lets us feed vncpasswd a TTY-fed password non-interactively
+          sudo apt-get install -y --no-install-recommends /tmp/kasmvnc.deb expect
           rm -f /tmp/kasmvnc.deb
 
           # Add current user to ssl-cert group so KasmVNC can read certs
           sudo usermod -aG ssl-cert "$USER" || true
 
-          # ---- CRITICAL: pre-seed the vncpasswd file BEFORE any kasmvncserver
-          # invocation, otherwise it triggers a stdin-hungry setup wizard ----
+          # ---- CRITICAL: kasmvncpasswd uses /dev/tty (not stdin) for reading
+          # the password, so a plain 'echo | kasmvncpasswd' fails with:
+          #     'getpass error: Inappropriate ioctl for device'
+          # Solution: use 'expect' to allocate a pseudo-TTY and feed both
+          # the password and the confirmation prompt.
           PASS="${KASM_PASS:-kasm1234}"
-          if [ ${#PASS} -lt 6 ]; then PASS="kasm1234"; fi
+          if [ ${#PASS} -lt 6 ]; then
+            echo "Password too short (<6), padding to 'kasm1234'"
+            PASS="kasm1234"
+            echo "KASM_PASS=$PASS" >> "$GITHUB_ENV"
+          fi
           mkdir -p "$HOME/.vnc"
-          # -ow => write user password from stdin, no prompts
-          echo "$PASS" | kasmvncpasswd -u kasm -ow
-          chmod 600 "$HOME/.vnc/passwd" 2>/dev/null || true
-          ls -la "$HOME/.vnc/"
-          # Now this call is safe (no wizard) and confirms binary works
+
+          # Use unquoted heredoc so bash expands $PASS, but wrap regexes in
+          # Tcl braces {} so Tcl doesn't try to run [Pp] as a command.
+          expect <<EOF
+          log_user 0
+          set timeout 30
+          spawn kasmvncpasswd -u kasm -ow
+          expect {
+              -re {[Pp]assword:} { send "$PASS\r"; exp_continue }
+              -re {[Vv]erify:}   { send "$PASS\r"; exp_continue }
+              -re {again:}       { send "$PASS\r"; exp_continue }
+              eof
+          }
+          EOF
+
+          # Verify the password file was written
+          if [ ! -s "$HOME/.kasmpasswd" ] && [ ! -s "$HOME/.vnc/passwd" ]; then
+            echo "::error::kasmvncpasswd did not produce a password file"
+            ls -la "$HOME/.vnc/" "$HOME/.kasmpasswd" 2>&1 || true
+            exit 1
+          fi
+          echo "Password file OK:"
+          ls -la "$HOME/.kasmpasswd" "$HOME/.vnc/" 2>/dev/null || true
+
+          # Confirm binary works without triggering the wizard
           kasmvncserver --version 2>/dev/null | head -3 || true
 
       - name: Install Cloudflared (for tunnel)
