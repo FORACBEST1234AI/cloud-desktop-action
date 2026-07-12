@@ -12,9 +12,9 @@ on:
         required: false
         default: '1600x900'
       password:
-        description: 'Web login password'
+        description: 'Web login password (min 6 chars)'
         required: false
-        default: 'kasm'
+        default: 'kasm1234'
 
 concurrency:
   group: desktop-${{ github.ref }}
@@ -57,7 +57,14 @@ jobs:
             python3 python3-pip \
             wget curl ca-certificates gnupg \
             sudo procps net-tools iproute2 unzip \
-            libgl1-mesa-dri libgles2-mesa
+            libgl1-mesa-dri libgles2-mesa \
+            libdatetime-perl libtry-tiny-perl libyaml-tiny-perl \
+            libhash-merge-simple-perl libscalar-list-utils-perl \
+            libswitch-perl libmodule-load-conditional-perl \
+            libxfont2 libfile-slurp-perl libmodule-runtime-perl \
+            libtypes-serialiser-perl libjson-perl libjson-xs-perl \
+            libcrypt-eksblowfish-perl libnet-ssleay-perl \
+            xkb-data x11-xkb-utils xfonts-base
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
@@ -99,8 +106,15 @@ jobs:
           mkdir -p "$HOME/.vnc"
 
           # Non-interactive password setup (user + view-only)
-          PASS="${KASM_PASS:-kasm}"
-          printf "%s\n%s\n%s\n%s\n" "$PASS" "$PASS" "n" "n" | kasmvncpasswd -u kasm -o -w || true
+          PASS="${KASM_PASS:-kasm1234}"
+          # Enforce min 6 chars (KasmVNC requirement)
+          if [ ${#PASS} -lt 6 ]; then
+            echo "Password too short (<6), padding to 'kasm1234'"
+            PASS="kasm1234"
+            echo "KASM_PASS=$PASS" >> "$GITHUB_ENV"
+          fi
+          # kasmvncpasswd -u <user> -ow  reads stdin without prompting (single pass)
+          echo "$PASS" | kasmvncpasswd -u kasm -ow
 
           # kasmvnc.yaml – disable SSL (Cloudflare terminates TLS)
           cat > "$HOME/.vnc/kasmvnc.yaml" <<'YAML'
@@ -224,7 +238,7 @@ jobs:
         env:
           KASM_PASS: ${{ github.event.inputs.password }}
         run: |
-          PASS="${KASM_PASS:-kasm}"
+          PASS="${KASM_PASS:-kasm1234}"
           echo "============================================================"
           echo " 🖥️  Cloud Desktop is READY"
           echo "============================================================"
