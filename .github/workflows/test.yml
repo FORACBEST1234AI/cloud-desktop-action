@@ -1,0 +1,68 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-yaml:
+    name: Validate workflow YAML
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install yamllint & actionlint
+        run: |
+          pip install --quiet yamllint
+          # actionlint via official installer
+          bash <(curl -sS https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.1 /usr/local/bin >/dev/null
+          echo "actionlint: $(actionlint -version)"
+      - name: yamllint
+        run: |
+          yamllint -c .yamllint.yml .github/workflows
+      - name: actionlint
+        run: |
+          actionlint -color
+
+  script-check:
+    name: Shell/Python syntax check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Extract & syntax-check embedded shell blocks
+        run: |
+          set -e
+          # Just make sure any *.sh files parse; embedded YAML run blocks
+          # are validated by actionlint above.
+          find . -name '*.sh' -print0 | xargs -0 -r bash -n
+          echo "All shell scripts parsed OK"
+      - name: Python syntax check
+        run: |
+          find . -name '*.py' -print0 | xargs -0 -r python3 -m py_compile
+          echo "All Python files parsed OK"
+
+  dryrun-kasmvnc-url:
+    name: KasmVNC release URL reachability
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: HEAD check KasmVNC .deb
+        run: |
+          URL="https://github.com/kasmtech/KasmVNC/releases/download/v1.3.3/kasmvncserver_jammy_1.3.3_amd64.deb"
+          code=$(curl -sILo /dev/null -w "%{http_code}" -L "$URL")
+          echo "HTTP $code for $URL"
+          # 200 or 302 both acceptable (GitHub redirects to S3)
+          [[ "$code" == "200" || "$code" == "302" ]]
+      - name: HEAD check cloudflared
+        run: |
+          URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          code=$(curl -sILo /dev/null -w "%{http_code}" -L "$URL")
+          echo "HTTP $code for $URL"
+          [[ "$code" == "200" || "$code" == "302" ]]

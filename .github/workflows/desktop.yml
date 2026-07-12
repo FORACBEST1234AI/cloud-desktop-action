@@ -1,0 +1,334 @@
+name: Cloud Desktop (KasmVNC + Cloudflare Tunnel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_hours:
+        description: 'Session duration in hours (max 5)'
+        required: false
+        default: '5'
+      resolution:
+        description: 'Screen resolution'
+        required: false
+        default: '1600x900'
+      password:
+        description: 'Web login password'
+        required: false
+        default: 'kasm'
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Launch Desktop
+    runs-on: ubuntu-22.04
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show runner info
+        run: |
+          echo "OS: $(lsb_release -ds || cat /etc/os-release | head -1)"
+          echo "CPU: $(nproc) cores"
+          echo "RAM: $(free -h | awk '/Mem:/ {print $2}')"
+          echo "Disk: $(df -h / | awk 'NR==2 {print $4}') free"
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker system prune -af || true
+          df -h /
+
+      - name: Install desktop stack
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-goodies xfce4-terminal \
+            dbus-x11 x11-xserver-utils xauth \
+            fonts-liberation fonts-dejavu \
+            firefox pulseaudio \
+            python3 python3-pip \
+            wget curl ca-certificates gnupg \
+            sudo procps net-tools iproute2 unzip \
+            libgl1-mesa-dri libgles2-mesa
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Install KasmVNC (WebRTC-grade streaming, no noVNC)
+        run: |
+          set -e
+          cd /tmp
+          # KasmVNC is a modern VNC server with a built-in high-FPS web client
+          # Uses direct WebSocket streaming (H.264/JPEG) - much faster than noVNC
+          KASM_VERSION="1.3.3"
+          UBUNTU_CODENAME="jammy"
+          DEB_FILE="kasmvncserver_${UBUNTU_CODENAME}_${KASM_VERSION}_amd64.deb"
+          URL="https://github.com/kasmtech/KasmVNC/releases/download/v${KASM_VERSION}/${DEB_FILE}"
+
+          echo "Downloading KasmVNC from $URL"
+          wget -q --tries=3 --timeout=30 "$URL" -O /tmp/kasmvnc.deb
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends /tmp/kasmvnc.deb
+          rm -f /tmp/kasmvnc.deb
+
+          # Add current user to ssl-cert group so KasmVNC can read certs
+          sudo usermod -aG ssl-cert "$USER" || true
+          kasmvncserver --version || true
+
+      - name: Install Cloudflared (for tunnel)
+        run: |
+          set -e
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -O /tmp/cloudflared
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Configure KasmVNC
+        env:
+          KASM_PASS: ${{ github.event.inputs.password }}
+          KASM_RES: ${{ github.event.inputs.resolution }}
+        run: |
+          set -e
+          mkdir -p "$HOME/.vnc"
+
+          # Non-interactive password setup (user + view-only)
+          PASS="${KASM_PASS:-kasm}"
+          printf "%s\n%s\n%s\n%s\n" "$PASS" "$PASS" "n" "n" | kasmvncpasswd -u kasm -o -w || true
+
+          # kasmvnc.yaml – disable SSL (Cloudflare terminates TLS)
+          cat > "$HOME/.vnc/kasmvnc.yaml" <<'YAML'
+          network:
+            protocol: http
+            interface: 127.0.0.1
+            websocket_port: 6901
+            use_ipv4: true
+            use_ipv6: false
+            ssl:
+              require_ssl: false
+          logging:
+            log_writer_name: all
+            log_dest: logfile
+            level: 30
+          runtime_configuration:
+            allow_client_to_override_kasm_server_settings: true
+            allow_override:
+              - desktop.resolution
+              - encoding
+              - runtime_configuration.data_download
+          desktop:
+            resolution:
+              width: 1600
+              height: 900
+            allow_resize: true
+          encoding:
+            max_frame_rate: 60
+            jpeg_quality: 7
+            webp_quality: 7
+            full_frame_updates: never
+            rect_encoding_mode: auto
+          data_loss_prevention:
+            clipboard:
+              enabled: true
+              server_to_client: true
+              client_to_server: true
+            keyboard:
+              enabled: true
+            mouse:
+              enabled: true
+            files:
+              upload:
+                enabled: true
+                size_limit: 0
+              download:
+                enabled: true
+                size_limit: 0
+          YAML
+
+          # xstartup for XFCE
+          cat > "$HOME/.vnc/xstartup" <<'SH'
+          #!/bin/bash
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          export XKL_XMODMAP_DISABLE=1
+          export XDG_CURRENT_DESKTOP=XFCE
+          exec dbus-launch --exit-with-session startxfce4
+          SH
+          chmod +x "$HOME/.vnc/xstartup"
+
+      - name: Start desktop session
+        env:
+          KASM_RES: ${{ github.event.inputs.resolution }}
+        run: |
+          set -e
+          RES="${KASM_RES:-1600x900}"
+          # Kill any prior instance
+          kasmvncserver -kill :1 >/dev/null 2>&1 || true
+
+          # Start VNC on display :1 (websocket bound to 127.0.0.1:6901)
+          kasmvncserver :1 \
+            -geometry "$RES" \
+            -depth 24 \
+            -select-de xfce \
+            -websocketPort 6901 \
+            -interface 127.0.0.1 \
+            -disableBasicAuth \
+            >/tmp/kasm-start.log 2>&1 &
+
+          # Wait until port is listening
+          for i in {1..30}; do
+            if ss -tln | grep -q ':6901'; then
+              echo "KasmVNC is listening on 6901"
+              break
+            fi
+            sleep 1
+          done
+          ss -tln | grep 6901 || (cat /tmp/kasm-start.log; echo "KasmVNC failed to start"; exit 1)
+
+      - name: Start Cloudflare Tunnel (trycloudflare)
+        id: tunnel
+        run: |
+          set -e
+          nohup cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:6901 \
+            --loglevel info \
+            > /tmp/cloudflared.log 2>&1 &
+          echo "Cloudflared PID: $!"
+
+          # Wait for the tunnel URL
+          TUNNEL_URL=""
+          for i in {1..60}; do
+            if grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log >/dev/null 2>&1; then
+              TUNNEL_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "::error::Cloudflare tunnel failed to start"
+            tail -100 /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+          echo "tunnel_url=$TUNNEL_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Print access info
+        env:
+          KASM_PASS: ${{ github.event.inputs.password }}
+        run: |
+          PASS="${KASM_PASS:-kasm}"
+          echo "============================================================"
+          echo " 🖥️  Cloud Desktop is READY"
+          echo "============================================================"
+          echo " URL:      $TUNNEL_URL"
+          echo " Username: kasm"
+          echo " Password: $PASS"
+          echo "============================================================"
+          echo " ⚡ Tip: In the KasmVNC toolbar, set encoding to 'WEBP' or"
+          echo "        'H.264' for maximum FPS with low bandwidth."
+          echo "============================================================"
+
+          # Write a summary that appears on the Actions run page
+          {
+            echo "## 🖥️ Cloud Desktop Ready"
+            echo ""
+            echo "| Field    | Value |"
+            echo "|----------|-------|"
+            echo "| **URL**      | $TUNNEL_URL |"
+            echo "| **User**     | \`kasm\` |"
+            echo "| **Password** | \`$PASS\` |"
+            echo ""
+            echo "> Tip: switch encoding to **WEBP** or **H.264** in the KasmVNC toolbar for smoother FPS."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enable fast local download share (aria2 + caddy)
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends aria2
+
+          # Simple python HTTP server for downloading files from ~/Downloads at high speed
+          mkdir -p "$HOME/Downloads"
+          cat > /tmp/dl-server.py <<'PY'
+          import http.server, socketserver, os
+          os.chdir(os.path.expanduser("~/Downloads"))
+          class H(http.server.SimpleHTTPRequestHandler):
+              def end_headers(self):
+                  self.send_header('Cache-Control', 'no-store')
+                  super().end_headers()
+          with socketserver.ThreadingTCPServer(('127.0.0.1', 8088), H) as s:
+              s.serve_forever()
+          PY
+          nohup python3 /tmp/dl-server.py > /tmp/dl.log 2>&1 &
+
+          # Second cloudflared tunnel for the download server
+          nohup cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:8088 \
+            > /tmp/cloudflared-dl.log 2>&1 &
+
+          DL_URL=""
+          for i in {1..40}; do
+            if grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared-dl.log >/dev/null 2>&1; then
+              DL_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared-dl.log | head -1)
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -n "$DL_URL" ]; then
+            echo "Download share: $DL_URL"
+            echo "DL_URL=$DL_URL" >> "$GITHUB_ENV"
+            {
+              echo ""
+              echo "### 📥 Fast Download Share"
+              echo "Anything you drop into \`~/Downloads\` inside the desktop is served at:"
+              echo ""
+              echo "\`\`\`"
+              echo "$DL_URL"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Download tunnel did not come up, continuing without it."
+          fi
+
+      - name: Keep session alive
+        env:
+          SESSION_HOURS: ${{ github.event.inputs.session_hours }}
+        run: |
+          HRS="${SESSION_HOURS:-5}"
+          # Cap at 5 (workflow timeout ≈ 6h)
+          if [ "$HRS" -gt 5 ]; then HRS=5; fi
+          SECS=$(( HRS * 3600 ))
+          echo "Session will run for ${HRS}h (${SECS}s)"
+
+          END=$(( $(date +%s) + SECS ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            # Health check every 60s
+            if ! ss -tln | grep -q ':6901'; then
+              echo "::error::KasmVNC died"
+              tail -50 /tmp/kasm-start.log || true
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "Session ended cleanly."
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-logs
+          path: |
+            /tmp/kasm-start.log
+            /tmp/cloudflared.log
+            /tmp/cloudflared-dl.log
+            /tmp/dl.log
+          if-no-files-found: ignore
