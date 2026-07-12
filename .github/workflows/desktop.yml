@@ -32,7 +32,7 @@ jobs:
 
       - name: Show runner info
         run: |
-          echo "OS: $(lsb_release -ds || cat /etc/os-release | head -1)"
+          echo "OS: $(lsb_release -ds || head -1 /etc/os-release)"
           echo "CPU: $(nproc) cores"
           echo "RAM: $(free -h | awk '/Mem:/ {print $2}')"
           echo "Disk: $(df -h / | awk 'NR==2 {print $4}') free"
@@ -182,7 +182,7 @@ jobs:
             >/tmp/kasm-start.log 2>&1 &
 
           # Wait until port is listening
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if ss -tln | grep -q ':6901'; then
               echo "KasmVNC is listening on 6901"
               break
@@ -203,7 +203,7 @@ jobs:
 
           # Wait for the tunnel URL
           TUNNEL_URL=""
-          for i in {1..60}; do
+          for _ in {1..60}; do
             if grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log >/dev/null 2>&1; then
               TUNNEL_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
               break
@@ -275,7 +275,7 @@ jobs:
             > /tmp/cloudflared-dl.log 2>&1 &
 
           DL_URL=""
-          for i in {1..40}; do
+          for _ in {1..40}; do
             if grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared-dl.log >/dev/null 2>&1; then
               DL_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared-dl.log | head -1)
               break
